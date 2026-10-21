@@ -1,0 +1,593 @@
+
+name: RDP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  secure-rdp:
+    runs-on: windows-11-arm
+    timeout-minutes: 360
+
+    steps:
+      - name: Show Windows and Hardware Information
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "========== WINDOWS 11 ARM64 =========="
+
+          $os = Get-CimInstance Win32_OperatingSystem
+          $cpu = Get-CimInstance Win32_Processor
+
+          $os | Select-Object Caption, Version, BuildNumber, OSArchitecture |
+            Format-List
+
+          $cpu | Select-Object Name, Architecture, NumberOfCores, NumberOfLogicalProcessors |
+            Format-List
+
+          $total = [math]::Round($os.TotalVisibleMemorySize / 1MB, 2)
+          $free = [math]::Round($os.FreePhysicalMemory / 1MB, 2)
+
+          Write-Host "RAM total: $total GB"
+          Write-Host "RAM disponível: $free GB"
+          Write-Host "RAM em uso: $([math]::Round($total - $free, 2)) GB"
+          Write-Host "Arquitetura reportada pelo Windows: $($os.OSArchitecture)"
+          Write-Host "======================================"
+
+          if ([version]$os.Version -lt [version]"10.0") {
+            throw "A versão detectada do Windows é incompatível com o Tailscale atual."
+          }
+
+          if ($os.Caption -notmatch "Windows 11") {
+            throw "O runner não está reportando Windows 11. Verifique a imagem real do runner."
+          }
+
+      - name: Configure Core RDP Settings
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' -Value 0 -Force
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' -Value 1 -Force
+
+          Get-NetFirewallRule -DisplayName 'RDP-Tailscale' `
+            -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+
+          New-NetFirewallRule `
+            -DisplayName 'RDP-Tailscale' `
+            -Direction Inbound -Action Allow `
+            -Protocol TCP -LocalPort 3389 `
+            -RemoteAddress '100.64.0.0/10' -Profile Any
+
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+          Write-Host "Configuração RDP concluída."
+
+      - name: Create Windows Account Rafael
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $username = "Rafael"
+          $plainPassword = "yyyy-MM-dd"
+
+          $securePassword = ConvertTo-SecureString `
+            $plainPassword -AsPlainText -Force
+
+          $existingUser = Get-LocalUser `
+            -Name $username -ErrorAction SilentlyContinue
+
+          if ($null -eq $existingUser) {
+            New-LocalUser -Name $username `
+              -Password $securePassword `
+              -AccountNeverExpires -ErrorAction Stop | Out-Null
+          }
+          else {
+            Set-LocalUser -Name $username `
+              -Password $securePassword -ErrorAction Stop
+          }
+
+          $userSid = (Get-LocalUser -Name $username).SID.Value
+
+          foreach ($group in @("Administrators", "Remote Desktop Users")) {
+            $members = Get-LocalGroupMember -Group $group -ErrorAction Stop
+
+            $isMember = $members | Where-Object {
+              $_.SID.Value -eq $userSid
+            }
+
+            if (-not $isMember) {
+              Add-LocalGroupMember -Group $group `
+                -Member $username -ErrorAction Stop
+            }
+          }
+
+          Write-Host "Conta Windows: Rafael"
+          Write-Host "Senha configurada."
+          Write-Host "Conta adicionada aos grupos necessários."
+
+      # NOVO: cria as ferramentas de backup e restauração.
+      - name: Prepare Persistent Backup Tools
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RDP_BACKUP_KEY: ${{ secrets.RDP_BACKUP_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+            throw "GITHUB_TOKEN não foi disponibilizado."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_BACKUP_KEY)) {
+            throw "Configure o secret RDP_BACKUP_KEY antes de continuar."
+          }
+
+          $scriptPath = Join-Path $env:RUNNER_TEMP "rdp-persistence.ps1"
+
+          @'
+          param(
+            [Parameter(Mandatory=$true)]
+            [ValidateSet("Restore","Backup")]
+            [string]$Mode
+          )
+
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+
+          $owner = $env:GITHUB_REPOSITORY_OWNER
+          $repo = $env:GITHUB_REPOSITORY
+          $repoName = $repo.Split("/")[-1]
+          $tag = "rdp-persistence"
+          $api = "https://api.github.com/repos/$repo"
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+
+          $work = Join-Path $env:RUNNER_TEMP "rdp-persistence"
+          New-Item -ItemType Directory -Path $work -Force | Out-Null
+
+          $zip = Join-Path $work "profile.zip"
+          $encrypted = Join-Path $work "profile-backup.enc"
+          $manifest = Join-Path $work "manifest.json"
+          $profile = "C:\Users\Rafael"
+
+          # A chave nunca é escrita no arquivo de backup.
+          $sha = [Security.Cryptography.SHA256]::Create()
+          $keyBytes = $sha.ComputeHash(
+            [Text.Encoding]::UTF8.GetBytes($env:RDP_BACKUP_KEY)
+          )
+          $sha.Dispose()
+
+          function Protect-Backup {
+            param([string]$Source, [string]$Destination)
+
+            $aes = [Security.Cryptography.Aes]::Create()
+            $aes.Key = $keyBytes
+            $aes.GenerateIV()
+
+            $inputStream = [IO.File]::OpenRead($Source)
+            $outputStream = [IO.File]::Create($Destination)
+
+            try {
+              # Os primeiros 16 bytes contêm o IV.
+              $outputStream.Write($aes.IV, 0, $aes.IV.Length)
+              $crypto = [Security.Cryptography.CryptoStream]::new(
+                $outputStream,
+                $aes.CreateEncryptor(),
+                [Security.Cryptography.CryptoStreamMode]::Write
+              )
+              $inputStream.CopyTo($crypto)
+              $crypto.FlushFinalBlock()
+              $crypto.Dispose()
+            }
+            finally {
+              $inputStream.Dispose()
+              $outputStream.Dispose()
+              $aes.Dispose()
+            }
+          }
+
+          function Unprotect-Backup {
+            param([string]$Source, [string]$Destination)
+
+            $inputStream = [IO.File]::OpenRead($Source)
+            $iv = New-Object byte[] 16
+            $read = $inputStream.Read($iv, 0, 16)
+
+            if ($read -ne 16) {
+              $inputStream.Dispose()
+              throw "Arquivo de backup inválido."
+            }
+
+            $aes = [Security.Cryptography.Aes]::Create()
+            $aes.Key = $keyBytes
+            $aes.IV = $iv
+            $outputStream = [IO.File]::Create($Destination)
+
+            try {
+              $crypto = [Security.Cryptography.CryptoStream]::new(
+                $inputStream,
+                $aes.CreateDecryptor(),
+                [Security.Cryptography.CryptoStreamMode]::Read
+              )
+              $crypto.CopyTo($outputStream)
+              $crypto.Dispose()
+            }
+            finally {
+              $inputStream.Dispose()
+              $outputStream.Dispose()
+              $aes.Dispose()
+            }
+          }
+
+          function Get-Release {
+            try {
+              return Invoke-RestMethod `
+                -Uri "$api/releases/tags/$tag" `
+                -Headers $headers
+            }
+            catch {
+              if ($_.Exception.Response.StatusCode.value__ -ne 404) {
+                throw
+              }
+              return $null
+            }
+          }
+
+          function Get-OrCreateRelease {
+            $release = Get-Release
+            if ($release) { return $release }
+
+            $body = @{
+              tag_name = $tag
+              name = "RDP Persistent Backup"
+              body = "Backups criptografados do perfil Windows."
+              draft = $false
+              prerelease = $true
+            } | ConvertTo-Json
+
+            return Invoke-RestMethod `
+              -Method Post `
+              -Uri "$api/releases" `
+              -Headers $headers `
+              -ContentType "application/json" `
+              -Body $body
+          }
+
+          if ($Mode -eq "Restore") {
+            Write-Host "Procurando backup persistente..."
+
+            $release = Get-Release
+            if (-not $release) {
+              Write-Host "Nenhum backup anterior encontrado."
+              exit 0
+            }
+
+            $asset = $release.assets |
+              Where-Object { $_.name -eq "profile-backup.enc" } |
+              Select-Object -First 1
+
+            if (-not $asset) {
+              Write-Host "Release existe, mas não possui backup."
+              exit 0
+            }
+
+            $downloadHeaders = @{
+              Authorization = "Bearer $env:GH_TOKEN"
+              Accept = "application/octet-stream"
+              "X-GitHub-Api-Version" = "2022-11-28"
+            }
+
+            Invoke-WebRequest `
+              -Uri $asset.url `
+              -Headers $downloadHeaders `
+              -OutFile $encrypted
+
+            $downloadHash = (Get-FileHash $encrypted -Algorithm SHA256).Hash
+            Write-Host "Backup baixado. SHA256: $downloadHash"
+
+            Unprotect-Backup -Source $encrypted -Destination $zip
+
+            Expand-Archive -Path $zip -DestinationPath $work -Force
+
+            $savedProfile = Join-Path $work "Rafael"
+            if (Test-Path $savedProfile) {
+              New-Item -ItemType Directory -Path $profile -Force |
+                Out-Null
+
+              # Não substitui arquivos do sistema operacional.
+              robocopy $savedProfile $profile /E /COPY:DAT /DCOPY:DAT `
+                /R:2 /W:2 /XJ `
+                /XD "Temp" "Cache" "Caches" `
+                /XF "NTUSER.DAT" "NTUSER.DAT.LOG*" `
+                "UsrClass.dat" "UsrClass.dat.LOG*" 
+
+              if ($LASTEXITCODE -ge 8) {
+                throw "Falha ao restaurar arquivos do perfil."
+              }
+            }
+
+            $appList = Join-Path $work "installed-apps.json"
+            if (Test-Path $appList) {
+              Write-Host "Inventário de aplicativos restaurado."
+              Write-Host "Arquivo: $appList"
+              Write-Host "O inventário não reinstala automaticamente os programas."
+            }
+
+            Write-Host "Restauração dos dados concluída."
+            exit 0
+          }
+
+          if ($Mode -eq "Backup") {
+            Write-Host "Preparando backup do perfil..."
+
+            if (-not (Test-Path $profile)) {
+              New-Item -ItemType Directory -Path $profile -Force |
+                Out-Null
+            }
+
+            Remove-Item $zip, $encrypted, $manifest `
+              -Force -ErrorAction SilentlyContinue
+
+            $payload = Join-Path $work "Rafael"
+            New-Item -ItemType Directory -Path $payload -Force |
+              Out-Null
+
+            $folders = @(
+              "Desktop",
+              "Documents",
+              "Downloads",
+              "Pictures",
+              "Videos",
+              "Music",
+              "Favorites",
+              "AppData\Roaming",
+              "AppData\Local"
+            )
+
+            foreach ($folder in $folders) {
+              $source = Join-Path $profile $folder
+              $destination = Join-Path $payload $folder
+
+              if (Test-Path $source) {
+                New-Item -ItemType Directory -Path $destination -Force |
+                  Out-Null
+
+                robocopy $source $destination /E /COPY:DAT /DCOPY:DAT `
+                  /R:1 /W:1 /XJ `
+                  /XD "Temp" "Cache" "Caches" "CrashDumps" `
+                  /XF "WebCache*" "LOCK" "*.tmp"
+
+                if ($LASTEXITCODE -ge 8) {
+                  throw "Falha copiando $folder."
+                }
+              }
+            }
+
+            # Inventário de aplicativos instalados.
+            $apps = @()
+            $registryPaths = @(
+              "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+              "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+              "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+            )
+
+            foreach ($path in $registryPaths) {
+              $apps += Get-ItemProperty $path -ErrorAction SilentlyContinue |
+                Where-Object { $_.DisplayName } |
+                Select-Object DisplayName, DisplayVersion, Publisher
+            }
+
+            $apps |
+              Sort-Object DisplayName -Unique |
+              ConvertTo-Json -Depth 4 |
+              Set-Content (Join-Path $work "installed-apps.json") -Encoding UTF8
+
+            $metadata = @{
+              created_utc = [DateTime]::UtcNow.ToString("o")
+              repository = $env:GITHUB_REPOSITORY
+              runner_os = [Environment]::OSVersion.VersionString
+              profile = "Rafael"
+              contents = $folders
+            }
+
+            $metadata | ConvertTo-Json -Depth 5 |
+              Set-Content $manifest -Encoding UTF8
+
+            Compress-Archive `
+              -Path (Join-Path $work "Rafael"), `
+                    (Join-Path $work "installed-apps.json"), `
+                    $manifest `
+              -DestinationPath $zip -CompressionLevel Optimal
+
+            Protect-Backup -Source $zip -Destination $encrypted
+
+            $hash = (Get-FileHash $encrypted -Algorithm SHA256).Hash
+            Write-Host "SHA256 do backup: $hash"
+            Write-Host "Tamanho criptografado: $((Get-Item $encrypted).Length) bytes"
+
+            $release = Get-OrCreateRelease
+
+            # Remove o asset anterior para permitir uma nova versão.
+            $old = $release.assets |
+              Where-Object { $_.name -eq "profile-backup.enc" }
+
+            foreach ($item in $old) {
+              Invoke-RestMethod `
+                -Method Delete `
+                -Uri "$api/releases/assets/$($item.id)" `
+                -Headers $headers
+            }
+
+            $uploadUri = "https://uploads.github.com/repos/$repoName"
+            # O endpoint correto inclui o proprietário e o ID do Release.
+            $uploadUri = "https://uploads.github.com/repos/$repo/releases/$($release.id)/assets?name=profile-backup.enc"
+
+            Invoke-RestMethod `
+              -Method Post `
+              -Uri $uploadUri `
+              -Headers @{
+                Authorization = "Bearer $env:GH_TOKEN"
+                Accept = "application/vnd.github+json"
+                "X-GitHub-Api-Version" = "2022-11-28"
+                "Content-Type" = "application/octet-stream"
+              } `
+              -InFile $encrypted `
+              -ContentType "application/octet-stream"
+
+            # Verifica que o asset realmente existe no Release.
+            $check = Invoke-RestMethod `
+              -Uri "$api/releases/$($release.id)/assets" `
+              -Headers $headers
+
+            $saved = $check | Where-Object {
+              $_.name -eq "profile-backup.enc"
+            } | Select-Object -First 1
+
+            if (-not $saved) {
+              throw "Não foi possível verificar o backup no Release."
+            }
+
+            if ($saved.size -ne (Get-Item $encrypted).Length) {
+              throw "O tamanho do backup remoto não corresponde ao arquivo local."
+            }
+
+            Write-Host "BACKUP VERIFICADO no GitHub Releases."
+            Write-Host "Asset: $($saved.name)"
+            Write-Host "Bytes confirmados: $($saved.size)"
+            Write-Host "Release: $($release.html_url)"
+          }
+          '@ | Set-Content -Path $scriptPath -Encoding UTF8
+
+          Write-Host "Ferramentas de persistência preparadas."
+
+      # NOVO: restaura dados antes de iniciar o acesso remoto.
+      - name: Restore Persistent Data
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RDP_BACKUP_KEY: ${{ secrets.RDP_BACKUP_KEY }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $scriptPath = Join-Path $env:RUNNER_TEMP "rdp-persistence.ps1"
+
+          & $scriptPath -Mode Restore
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falha na restauração do backup."
+          }
+
+      - name: Prepare Windows Services for Tailscale
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $requiredServices = @(
+            "Dnscache",
+            "iphlpsvc",
+            "netprofm",
+            "WinHttpAutoProxySvc"
+          )
+
+          foreach ($serviceName in $requiredServices) {
+            $service = Get-Service -Name $serviceName -ErrorAction Stop
+
+            Write-Host "Verificando serviço: $serviceName"
+
+            if ($service.StartType -eq "Disabled") {
+              Set-Service -Name $serviceName -StartupType Manual
+            }
+
+            $service = Get-Service -Name $serviceName
+
+            if ($service.Status -ne "Running") {
+              Start-Service -Name $serviceName
+            }
+
+            $service = Get-Service -Name $serviceName
+
+            if ($service.Status -ne "Running") {
+              throw "O serviço $serviceName não está funcionando."
+            }
+
+            Write-Host "$serviceName está funcionando."
+          }
+
+      - name: Install Tailscale ARM64
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $installerPath = Join-Path $env:TEMP "tailscale-arm64.msi"
+          $logPath = Join-Path $env:TEMP "tailscale-install.log"
+          $tsExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-arm64.msi"
+
+          if (Test-Path $tsExe) {
+            Write-Host "Tailscale já está instalado."
+            & $tsExe version
+
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "Instalação existente validada."
+              exit 0
+            }
+          }
+
+          try {
+            Write-Host "Baixando o MSI ARM64 oficial do Tailscale..."
+
+            Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
+
+            if (-not (Test-Path $installerPath)) {
+              throw "O instalador ARM64 não foi baixado."
+            }
+
+            if ((Get-Item $installerPath).Length -lt 1000000) {
+              throw "O arquivo baixado está incompleto ou é inválido."
+            }
+
+            Write-Host "Iniciando instalação silenciosa..."
+            Write-Host "Log detalhado: $logPath"
+
+            $arguments = @(
+              "/i"
+              "`"$installerPath`""
+              "/qn"
+              "/norestart"
+              "/L*V"
+              "`"$logPath`""
+              "TS_NOLAUNCH=1"
+              "TS_UNATTENDEDMODE=always"
+            ) -join " "
+
+            $process = Start-Process `
+              -FilePath "$env:SystemRoot\System32\msiexec.exe" `
+              -ArgumentList $arguments -Wait -PassThru
+
+            Write-Host "Código de saída: $($process.ExitCode)"
+
+            if ($process.ExitCode -notin @(0, 3010)) {
+              if (Test-Path $logPath) {
+                Select-String -Path $logPath `
+                  -Pattern "Return value 3|Error 1603|Installation failed|LaunchCondition" `
+                  -Context 5, 10 |
+                  Select-Object -Last 20 |
+                  ForEach-Object {
+                    Write-Host $_.ToString()
+                    $_.Context.PreContext | ForEach-Object { Write-H
